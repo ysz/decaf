@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="0.1.0"
 STATE_FILE="/tmp/decaf.pid"
 STOP_REQUEST_FILE="/tmp/decaf.stop"   # menubar writes this to ask all decafs to exit (no sudo needed)
 LOG_DIR="${HOME}/Library/Logs"
