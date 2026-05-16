@@ -71,12 +71,23 @@ no sudo at install time.
 
 After install, click the ☕ in your menubar →
 **Set up auto-sleep for Claude Code / Codex**. This merges hook entries
-into `~/.claude/settings.json` and `~/.codex/hooks.json` (with
-backups). Codex may ask you to review newly configured hooks; open
-`/hooks` in Codex and trust Decaf if prompted. Restart any Codex sessions
-that were already open before setup. Without this setup, Decaf can still
-be used manually with Start/Stop, `--watch <pid>`, or `decaf -- <cmd>`,
-but auto-sleep events will not fire.
+into `~/.claude/settings.json` and `~/.codex/hooks.json` (with backups).
+A dialog reports which CLIs got set up.
+
+**Codex requires one manual step.** Codex's hook system needs explicit
+trust before it fires any hook — writing `hooks.json` is not enough.
+Open Codex, run `/hooks`, and approve the three entries Decaf added:
+
+- `UserPromptSubmit` — Decaf: tracking Codex prompt
+- `Stop` — Decaf: tracking Codex stop
+- `PermissionRequest` — Decaf: tracking Codex permission request
+
+Restart any Codex sessions that were already open before setup. Decaf
+auto-detects the approval (it reads Codex's `[hooks.state.*]` blocks in
+`~/.codex/config.toml`) and hides the setup button once done.
+
+Without this setup, Decaf can still be used manually with Start/Stop,
+`--watch <pid>`, or `decaf -- <cmd>`, but auto-sleep events will not fire.
 
 ### Why the admin password prompt on first Start?
 

@@ -78,7 +78,17 @@ struct MenuView: View {
     }
 
     private var showOptionalSetup: Bool {
-        !controller.hooksInstalled || !controller.telegramConfigured
+        needsHooksSetup || !controller.telegramConfigured
+    }
+
+    /// True when at least one detected CLI still needs hooks installed.
+    /// Hides the setup button in two cases: nothing detected (nothing to
+    /// configure) and everything detected is already configured. Otherwise
+    /// the button would disappear after Claude is set up while Codex still
+    /// awaits `/hooks` approval.
+    private var needsHooksSetup: Bool {
+        (controller.claudeDetected && !controller.claudeHooksInstalled)
+            || (controller.codexDetected && !controller.codexHooksInstalled)
     }
 
     /// Status row tells the user what the Mac is doing right now. When On,
@@ -121,12 +131,74 @@ struct MenuView: View {
 
     @ViewBuilder
     private var setupHooks: some View {
-        if controller.hooksInstalled {
-            Text("✓ Auto-sleep for Claude Code / Codex")
-                .font(.caption)
+        if !needsHooksSetup {
+            EmptyView()
         } else {
-            Button("○ Set up auto-sleep for Claude Code / Codex") { controller.runSetup() }
-                .disabled(controller.binaryPath == nil)
+            Button("○ Set up auto-sleep for Claude Code / Codex") {
+                Task {
+                    let result = await controller.runSetup()
+                    await MainActor.run { showSetupAlert(result: result) }
+                }
+            }
+            .disabled(controller.binaryPath == nil)
+        }
+    }
+
+    /// Post-setup alert. Tells the user exactly which CLI got configured and,
+    /// for Codex, walks them through the `/hooks` approval step since Codex's
+    /// hook system requires explicit user-side trust before any hook fires.
+    private func showSetupAlert(result: Controller.SetupResult) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Auto-sleep setup"
+
+        var lines: [String] = []
+        switch result.claudeStatus {
+        case .configured:
+            lines.append("Claude Code: ✓ Configured (hooks written to ~/.claude/settings.json).")
+        case .notDetected:
+            lines.append("Claude Code: Not detected — skipped.")
+        case .awaitingApproval:
+            lines.append("Claude Code: Hooks written, but state could not be verified.")
+        case .failed(let msg):
+            lines.append("Claude Code: ⚠ \(msg)")
+        }
+
+        switch result.codexStatus {
+        case .configured:
+            lines.append("")
+            lines.append("Codex: ✓ Configured and approved.")
+        case .notDetected:
+            lines.append("")
+            lines.append("Codex: Not detected — skipped.")
+        case .awaitingApproval:
+            lines.append("")
+            lines.append("Codex: ⚠ Hooks written to ~/.codex/hooks.json but Codex requires manual approval.")
+            lines.append("")
+            lines.append("Open Codex, run /hooks, and approve these entries:")
+            lines.append("  • UserPromptSubmit — Decaf: tracking Codex prompt")
+            lines.append("  • Stop — Decaf: tracking Codex stop")
+            lines.append("  • PermissionRequest — Decaf: tracking Codex permission request")
+            lines.append("")
+            lines.append("Click Refresh once you've approved them.")
+        case .failed(let msg):
+            lines.append("")
+            lines.append("Codex: ⚠ \(msg)")
+        }
+        alert.informativeText = lines.joined(separator: "\n")
+
+        // Refresh button only useful when something is still pending.
+        let pending: Bool = {
+            if case .awaitingApproval = result.codexStatus { return true }
+            return false
+        }()
+        alert.addButton(withTitle: "OK")
+        if pending {
+            alert.addButton(withTitle: "Refresh")
+        }
+        let resp = alert.runModal()
+        if pending && resp == .alertSecondButtonReturn {
+            controller.refreshHooksState()
         }
     }
 
@@ -187,16 +259,32 @@ struct MenuView: View {
             attributes: [.foregroundColor: NSColor.labelColor, .font: font]
         ))
         credits.append(NSAttributedString(
-            string: "Made by Grisha\n2026\n",
+            string: "Made by ",
             attributes: [.foregroundColor: NSColor.secondaryLabelColor, .font: font]
         ))
         credits.append(NSAttributedString(
-            string: "github.com/ysz/decaf",
+            string: "Grisha",
+            attributes: [
+                .link: URL(string: "https://grisha.me")!,
+                .foregroundColor: NSColor.linkColor,
+                .font: font,
+            ]
+        ))
+        credits.append(NSAttributedString(
+            string: " (",
+            attributes: [.foregroundColor: NSColor.secondaryLabelColor, .font: font]
+        ))
+        credits.append(NSAttributedString(
+            string: "repo",
             attributes: [
                 .link: URL(string: "https://github.com/ysz/decaf")!,
                 .foregroundColor: NSColor.linkColor,
                 .font: font,
             ]
+        ))
+        credits.append(NSAttributedString(
+            string: ")\n2026",
+            attributes: [.foregroundColor: NSColor.secondaryLabelColor, .font: font]
         ))
         // Center everything in the About panel — matches Apple's default layout.
         let paragraph = NSMutableParagraphStyle()

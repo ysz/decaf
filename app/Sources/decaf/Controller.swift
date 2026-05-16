@@ -13,6 +13,10 @@ final class Controller: ObservableObject {
     @Published private(set) var state: AgentState = .stopped
     @Published private(set) var binaryPath: String?
     @Published private(set) var hooksInstalled: Bool = false
+    @Published private(set) var claudeDetected: Bool = false
+    @Published private(set) var claudeHooksInstalled: Bool = false
+    @Published private(set) var codexDetected: Bool = false
+    @Published private(set) var codexHooksInstalled: Bool = false
     @Published private(set) var telegramConfigured: Bool = false
     @Published private(set) var loginItemEnabled: Bool = false
     @Published private(set) var sleepWhenDone: Bool = true
@@ -41,6 +45,7 @@ final class Controller: ObservableObject {
     private let stopRequestFile = "/tmp/decaf.stop"
     private let claudeSettings = "\(NSHomeDirectory())/.claude/settings.json"
     private let codexHooks = "\(NSHomeDirectory())/.codex/hooks.json"
+    private let codexConfig = "\(NSHomeDirectory())/.codex/config.toml"
     private let envFile = EnvFile(path: "\(NSHomeDirectory())/.decaf/.env")
     private let loginItemFirstRunKey = "DecafDidAutoEnableLoginItem"
     /// Narrow NOPASSWD rule for `pmset -b disablesleep 0|1`. Written once by
@@ -51,7 +56,11 @@ final class Controller: ObservableObject {
 
     init() {
         self.binaryPath = Self.locateBinary()
-        self.hooksInstalled = Self.checkHooksInstalled(claudeSettings: claudeSettings, codexHooks: codexHooks)
+        Self.refreshAgentState(
+            claudeSettings: claudeSettings,
+            codexHooks: codexHooks,
+            codexConfig: codexConfig
+        ).apply(to: self)
         self.telegramConfigured = Self.checkTelegramConfigured(envFile: envFile)
         let (swd, delay) = Self.readSleepSettings(envFile: envFile)
         self.sleepWhenDone = swd
@@ -100,14 +109,119 @@ final class Controller: ObservableObject {
         return nil
     }
 
-    private static func checkHooksInstalled(claudeSettings: String, codexHooks: String) -> Bool {
-        for path in [claudeSettings, codexHooks] {
-            if let contents = try? String(contentsOfFile: path, encoding: .utf8),
-               contents.contains("decaf-hook") {
+    struct HookState {
+        let claudeDetected: Bool
+        let claudeHooksInstalled: Bool
+        let codexDetected: Bool
+        let codexHooksInstalled: Bool
+        var hooksInstalled: Bool {
+            (claudeDetected && claudeHooksInstalled) || (codexDetected && codexHooksInstalled)
+        }
+        /// True when every detected agent has hooks set up. False if nothing
+        /// is detected (no reason to consider it "configured" when there's
+        /// nothing to configure — caller checks `hasAnyAgent` for that).
+        var fullyConfigured: Bool {
+            guard claudeDetected || codexDetected else { return false }
+            let claudeOK = !claudeDetected || claudeHooksInstalled
+            let codexOK = !codexDetected || codexHooksInstalled
+            return claudeOK && codexOK
+        }
+        @MainActor
+        func apply(to controller: Controller) {
+            controller.claudeDetected = claudeDetected
+            controller.claudeHooksInstalled = claudeHooksInstalled
+            controller.codexDetected = codexDetected
+            controller.codexHooksInstalled = codexHooksInstalled
+            controller.hooksInstalled = hooksInstalled
+        }
+    }
+
+    private static func refreshAgentState(
+        claudeSettings: String,
+        codexHooks: String,
+        codexConfig: String
+    ) -> HookState {
+        HookState(
+            claudeDetected: detectClaude(claudeSettings: claudeSettings),
+            claudeHooksInstalled: fileContains(path: claudeSettings, needle: "decaf-hook"),
+            codexDetected: detectCodex(codexConfig: codexConfig),
+            codexHooksInstalled: checkCodexHooksApproved(
+                codexHooks: codexHooks,
+                codexConfig: codexConfig
+            )
+        )
+    }
+
+    private static func detectClaude(claudeSettings: String) -> Bool {
+        if FileManager.default.fileExists(atPath: claudeSettings) { return true }
+        return binaryInPath("claude")
+    }
+
+    private static func detectCodex(codexConfig: String) -> Bool {
+        if FileManager.default.fileExists(atPath: codexConfig) { return true }
+        return binaryInPath("codex")
+    }
+
+    /// Walks PATH and looks for an executable. We can't rely on `command -v`
+    /// because the menubar app's environment doesn't include the user's shell
+    /// rc additions (npm/brew prefixes etc) — but the parent shell's PATH does
+    /// propagate via LaunchServices for GUI apps, so this works in practice.
+    private static func binaryInPath(_ name: String) -> Bool {
+        guard let path = ProcessInfo.processInfo.environment["PATH"] else { return false }
+        for dir in path.split(separator: ":") {
+            if FileManager.default.isExecutableFile(atPath: "\(dir)/\(name)") {
                 return true
             }
         }
         return false
+    }
+
+    private static func fileContains(path: String, needle: String) -> Bool {
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return false
+        }
+        return contents.contains(needle)
+    }
+
+    /// Codex prints hooks under review on every session but doesn't actually
+    /// fire them until the user runs `/hooks` and approves. Approval is
+    /// persisted in ~/.codex/config.toml as `[hooks.state."<path>:<event>:<i>:<j>"]`
+    /// blocks. We consider Codex hooks "approved" when our three events all
+    /// have such a block in config.toml. Index is `0:0` because decaf writes
+    /// exactly one hook per event and the bash setup_codex_cli ensures we own
+    /// the file (it backs up existing content first then rewrites just our
+    /// entries — see engine/decaf:setup_codex_cli).
+    private static func checkCodexHooksApproved(codexHooks: String, codexConfig: String) -> Bool {
+        // First make sure hooks.json has our entries — otherwise approval is moot.
+        guard fileContains(path: codexHooks, needle: "decaf-hook") else { return false }
+        guard let toml = try? String(contentsOfFile: codexConfig, encoding: .utf8) else {
+            return false
+        }
+        // Codex lowercases event names in the state key:
+        //   UserPromptSubmit → user_prompt_submit
+        //   Stop             → stop
+        //   PermissionRequest → permission_request
+        let events = ["user_prompt_submit", "stop", "permission_request"]
+        for event in events {
+            // Match `[hooks.state."...:<event>:N:N"]` anywhere in the TOML;
+            // we don't care about the exact path or indices (avoids brittleness
+            // if Codex ever renumbers them). The leading colon stops accidental
+            // suffix matches.
+            let pattern = "[hooks.state.\"" // start of section
+            // Look for the section header line that ends with `:<event>:`-prefix.
+            // A simple `contains(":\(event):")` substring scan inside any line
+            // beginning with the section prefix is enough.
+            var found = false
+            for line in toml.split(separator: "\n") {
+                let s = String(line)
+                if s.hasPrefix(pattern) && s.contains(":\(event):") {
+                    found = true
+                    break
+                }
+            }
+            if !found { return false }
+        }
+        return true
     }
 
     private static func checkTelegramConfigured(envFile: EnvFile) -> Bool {
@@ -472,24 +586,60 @@ final class Controller: ObservableObject {
         try? envFile.write(updates: ["SLEEP_DELAY_MIN": String(clamped)])
     }
 
-    func runSetup() {
+    struct SetupResult {
+        let claudeStatus: AgentSetupStatus
+        let codexStatus: AgentSetupStatus
+    }
+
+    enum AgentSetupStatus {
+        case notDetected
+        case configured           // Claude: hooks in settings.json. Codex: approved via /hooks.
+        case awaitingApproval     // Codex only: hooks.json written, /hooks approval pending.
+        case failed(String)
+    }
+
+    /// Refreshes detection + hook-installed state from disk. Call after any
+    /// external change (decaf setup completion, user editing config by hand).
+    func refreshHooksState() {
+        Self.refreshAgentState(
+            claudeSettings: claudeSettings,
+            codexHooks: codexHooks,
+            codexConfig: codexConfig
+        ).apply(to: self)
+    }
+
+    func runSetup() async -> SetupResult {
         guard let bin = binaryPath else {
             state = .error("decaf binary not found in PATH")
-            return
+            return SetupResult(
+                claudeStatus: .failed("decaf binary not found"),
+                codexStatus: .failed("decaf binary not found")
+            )
         }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["setup"]
-        p.terminationHandler = { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.hooksInstalled = Self.checkHooksInstalled(
-                    claudeSettings: self.claudeSettings,
-                    codexHooks: self.codexHooks
-                )
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: bin)
+            p.arguments = ["setup"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            p.terminationHandler = { _ in continuation.resume() }
+            do {
+                try p.run()
+            } catch {
+                continuation.resume()
             }
         }
-        try? p.run()
+        refreshHooksState()
+        return SetupResult(
+            claudeStatus: claudeDetected
+                ? (claudeHooksInstalled ? .configured : .failed("hooks not written"))
+                : .notDetected,
+            codexStatus: codexDetected
+                ? (codexHooksInstalled
+                    ? .configured
+                    : .awaitingApproval)
+                : .notDetected
+        )
     }
 
     // MARK: - Telegram
