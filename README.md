@@ -1,5 +1,7 @@
 # Decaf
 
+**macOS menubar app (+ bash CLI) for Claude Code & Codex. Requires macOS 14 Sonoma or later.**
+
 <p align="center">
   <img src="https://github.com/user-attachments/assets/dcb49ba5-be21-4ec1-8b28-33602a194abd" alt="Decaf" width="480" />
 </p>
