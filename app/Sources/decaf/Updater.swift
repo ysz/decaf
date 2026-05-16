@@ -52,7 +52,7 @@ final class Updater: ObservableObject {
         }
 
         timer = Timer.scheduledTimer(withTimeInterval: Self.checkInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.checkOnce() }
+            Task { @MainActor [weak self] in await self?.checkOnce() }
         }
     }
 

@@ -250,7 +250,7 @@ final class Controller: ObservableObject {
         // 0.5s tick: state flip is visible within ~500ms of bash creating or
         // removing /tmp/decaf.pid. Cheap (one file stat + one kill(0) syscall).
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshState() }
+            Task { @MainActor [weak self] in self?.refreshState() }
         }
     }
 
