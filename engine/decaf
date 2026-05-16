@@ -435,20 +435,24 @@ notify_local() {
 }
 
 play_system_sound() {
-  local sound="$1" file="/System/Library/Sounds/${sound}.aiff"
+  # Two `local` statements, not one. bash 3.2 evaluates every RHS in a
+  # single `local` line BEFORE any of the assignments take effect, so
+  # `local sound="$1" file="${sound}.aiff"` would read `$sound` from the
+  # caller's scope (dynamic scoping) — unset for callers that don't have
+  # their own `sound`, which trips `set -u` and kills the watcher.
+  local sound="$1"
+  local file="/System/Library/Sounds/${sound}.aiff"
   [[ -r "$file" ]] || return 0
   /usr/bin/afplay "$file" >/dev/null 2>&1 || true
 }
 
 notify_all_done() {
   local seconds="${1:-0}" title body
-  title="decaf: all agents done"
+  title="All agents done"
   if [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds > 0 )); then
-    body="All tracked Claude Code / Codex sessions finished.
-Sleeping Mac in ${seconds}s."
+    body="Sleeping Mac in ${seconds}s."
   else
-    body="All tracked Claude Code / Codex sessions finished.
-Sleeping Mac now."
+    body="Sleeping Mac now."
   fi
   notify_local "$title" "$body"
   notify_webhook "$title" "$body"
@@ -464,20 +468,18 @@ notify_event() {
   dur_str=$(fmt_dur "$(( $(date +%s) - start_ts ))")
   case "$ev_type" in
     stop)
-      title="decaf: session done (${cwd})"
-      body="${agent} in ${cwd} finished
-running ${dur_str}"
+      title="${cwd} — session done"
+      body="${agent} finished in ${dur_str}"
       sound="Glass"
       ;;
     notification)
-      title="decaf: session needs you (${cwd})"
-      body="${agent} in ${cwd} is waiting
-running ${dur_str}"
+      title="${cwd} — needs you"
+      body="${agent} is waiting (${dur_str})"
       sound="Hero"
       ;;
     *)
-      title="decaf: event ${ev_type} (${cwd})"
-      body="running ${dur_str}"
+      title="${cwd} — ${ev_type}"
+      body="${dur_str}"
       sound="Pop"
       ;;
   esac
@@ -982,14 +984,14 @@ main() {
   [[ -s "$OUT_FILE" ]] && tail_out=$(tail -10 "$OUT_FILE")
 
   if [[ -n "$WATCH_PID" ]]; then
-    title="decaf: PID $WATCH_PID done (${dur_str})"
+    title="PID $WATCH_PID done (${dur_str})"
     body="watched pid: $WATCH_PID
 duration: ${dur_str}"
   else
     if (( child_ec == 0 )); then
-      title="decaf: done in ${dur_str}"
+      title="Done in ${dur_str}"
     else
-      title="decaf: exit $child_ec in ${dur_str}"
+      title="Exit $child_ec in ${dur_str}"
     fi
     body="cmd: ${CMD[*]}
 duration: ${dur_str}
