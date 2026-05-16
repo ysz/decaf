@@ -1,0 +1,1014 @@
+#!/usr/bin/env bash
+# decaf — keep macOS awake while a long-running agent finishes, then tell you.
+# See README.md for design notes. State on closed-lid mode: /tmp/decaf.pid
+# Hook events from agents: /tmp/decaf.events.$UID
+# Compatible with macOS system bash 3.2 (no associative arrays).
+
+set -euo pipefail
+
+VERSION="1.4.0"
+STATE_FILE="/tmp/decaf.pid"
+STOP_REQUEST_FILE="/tmp/decaf.stop"   # menubar writes this to ask all decafs to exit (no sudo needed)
+LOG_DIR="${HOME}/Library/Logs"
+DECAF_UID="${UID:-$(id -u)}"
+EVENT_FILE="${DECAF_EVENT_FILE:-/tmp/decaf.events.${DECAF_UID}}"
+CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
+CODEX_CONFIG="${HOME}/.codex/config.toml"
+CODEX_HOOKS="${HOME}/.codex/hooks.json"
+HOOK_MARKER="decaf-hook"
+
+TICK_SECS=5
+ALL_DONE_DEBOUNCE_SECS=30   # all tracked sessions must be idle this long before ALL_DONE fires
+ALL_DONE_SLEEP_GRACE_SECS=15 # after ALL_DONE, wait this long before pmset sleepnow
+
+CLOSED_LID=1            # default: keep system awake with lid closed (use --no-closed-lid to disable)
+WEBHOOK=""
+WATCH_PID=""
+AUTO_MODE=0
+SUBCMD=""
+SETUP_REMOVE=0
+declare -a CMD=()
+
+# Read from ~/.decaf/.env (also reloaded each tick — menubar toggle propagates
+# without restart). SLEEP_WHEN_DONE=1 fires pmset sleepnow after a short
+# all-done grace period (default, current product). =0 keeps the system awake;
+# if SLEEP_DELAY_MIN>0, sleep anyway after N minutes since all-done (timer
+# resets on new prompt).
+SLEEP_WHEN_DONE=1
+SLEEP_DELAY_MIN=0
+
+OUT_FILE=""
+WATCHER_PID=""
+CAFFEINATE_PID=""
+KEEPALIVE_PID=""
+DISABLESLEEP_SET=0
+PREV_DISABLESLEEP="0"
+# Set to 1 when a startup probe confirms `sudo -n /usr/bin/pmset …` works
+# without prompting — i.e. /etc/sudoers.d/decaf is in place (installed by the
+# menubar app on first Start). When set, we skip the interactive `sudo -v`
+# prompt AND skip sudo_keepalive (NOPASSWD doesn't expire).
+HAS_NOPASSWD_PMSET=0
+
+usage() {
+  cat <<EOF
+decaf $VERSION — keep macOS awake while your agent runs
+
+Usage:
+  decaf [--notify <url>]                                    (auto, closed-lid ON)
+  decaf [--no-closed-lid] [...]                             (just listen, don't toggle pmset)
+  decaf [--notify <url>] --watch <pid>
+  decaf [--notify <url>] -- <command> [args...]
+
+  decaf setup [--remove]                                    (configure agent hooks)
+
+Modes:
+  auto (default)     Listen for Claude Code / Codex hook events (Stop /
+                     UserPromptSubmit / Notification / PermissionRequest).
+                     Track per-session state; sleep ${ALL_DONE_SLEEP_GRACE_SECS}s after every
+                     active session has been idle ${ALL_DONE_DEBOUNCE_SECS}s and the lid is closed.
+  --watch <pid>      Attach to one specific PID.
+  -- <command>       Spawn <command> as a child and watch it.
+
+Options:
+  --closed-lid       (default) Keep system awake with lid closed — asks for
+                     admin password once per session. When all tracked
+                     sessions are done, pmset reverts and \`pmset sleepnow\`
+                     fires if lid is shut.
+  --no-closed-lid    Don't touch pmset disablesleep — system will sleep
+                     normally when you close the lid.
+  --notify <url>     POST exit summary to webhook (ntfy / Pushover / Discord / Slack).
+  -h, --help         Show this help.
+
+Subcommands:
+  setup              Install agent hooks for instant "done" notifications.
+                     Supports Claude Code CLI (~/.claude/settings.json)
+                     and Codex CLI (~/.codex/hooks.json).
+  setup --remove     Uninstall those hooks.
+
+Examples:
+  decaf setup                            # one-time hook install
+  decaf                                  # listen for agent hooks
+  decaf --closed-lid                     # same, allow lid-close
+  decaf --watch 41224                    # attach to one PID
+  decaf -- claude --dangerously-skip-permissions
+  decaf --notify https://ntfy.sh/me      # auto + webhook
+EOF
+}
+
+log() { echo "[decaf] $*" >&2; }
+err() { echo "[decaf] ERROR: $*" >&2; }
+
+parse_flags() {
+  if [[ "${1:-}" == "setup" ]]; then
+    SUBCMD="setup"; shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --remove) SETUP_REMOVE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) err "Unknown setup arg: $1"; exit 2 ;;
+      esac
+    done
+    return
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --closed-lid)    CLOSED_LID=1; shift ;;
+      --no-closed-lid) CLOSED_LID=0; shift ;;
+      --notify)     WEBHOOK="${2:-}"; shift 2 ;;
+      --watch)      WATCH_PID="${2:-}"; shift 2 ;;
+      auto)         AUTO_MODE=1; shift ;;
+      -h|--help)    usage; exit 0 ;;
+      --)           shift; CMD=("$@"); break ;;
+      *)            err "Unknown argument: $1"; usage; exit 2 ;;
+    esac
+  done
+
+  if [[ -z "$WATCH_PID" && ${#CMD[@]} -eq 0 ]]; then
+    AUTO_MODE=1
+  fi
+
+  if [[ -n "$WATCH_PID" ]] && ! kill -0 "$WATCH_PID" 2>/dev/null; then
+    err "PID $WATCH_PID is not running"; exit 2
+  fi
+}
+
+battery_check() {
+  local line pct
+  line=$(pmset -g batt 2>/dev/null | sed -n '2p' || true)
+  if [[ "$line" == *"Battery Power"* ]]; then
+    pct=$(printf '%s' "$line" | grep -Eo '[0-9]+%' | head -1 | tr -d '%' || true)
+    if [[ -n "$pct" ]] && (( pct < 15 )); then
+      err "On battery at ${pct}% — refusing --closed-lid (set OK_ON_LOW_BATTERY=1 to override)"
+      [[ "${OK_ON_LOW_BATTERY:-0}" == "1" ]] || exit 3
+    fi
+  fi
+}
+
+current_sleepdisabled() {
+  pmset -g | awk '/SleepDisabled/ { print $2; exit }'
+}
+
+# Privileged pmset toggle. Preferred path: NOPASSWD rule in /etc/sudoers.d/decaf
+# (installed once by the menubar app on first Start) makes `sudo -n` succeed
+# silently. Fallbacks: cached sudo timestamp from interactive `sudo -v` +
+# keepalive (legacy path when no rule), or osascript admin as last resort.
+set_disablesleep() {
+  local val="$1"
+  if sudo -n /usr/bin/pmset -b disablesleep "$val" 2>/dev/null; then
+    return 0
+  fi
+  if sudo /usr/bin/pmset -b disablesleep "$val" 2>/dev/null; then
+    return 0
+  fi
+  osascript -e "do shell script \"/usr/bin/pmset -b disablesleep $val\" with administrator privileges" >/dev/null
+}
+
+lid_closed() {
+  ioreg -r -k AppleClamshellState -d 4 2>/dev/null \
+    | grep -E '"AppleClamshellState"[[:space:]]*=' \
+    | head -1 | grep -q 'Yes'
+}
+
+clamshell_watcher() {
+  # Detach from parent's traps. Otherwise this forked subshell inherits the
+  # EXIT/TERM trap and tries to run cleanup() (revert pmset etc.) on its own
+  # death — racing the parent's cleanup and hanging parent's `wait WATCHER_PID`.
+  trap - EXIT INT TERM HUP
+  local parent="$1"
+  while kill -0 "$parent" 2>/dev/null; do
+    sleep 2
+    if lid_closed; then
+      pmset displaysleepnow 2>/dev/null || true
+    fi
+  done
+}
+
+# Hold PreventUserIdleSystemSleep assertion for our entire script lifetime.
+hold_idle_assertion() {
+  caffeinate -i -w "$$" &
+  CAFFEINATE_PID=$!
+}
+
+# Refresh sudo timestamp every 60s so we can revert pmset / re-arm without
+# prompting the user mid-session (default sudo cache is 5 min).
+sudo_keepalive() {
+  trap - EXIT INT TERM HUP   # don't inherit parent's cleanup trap (see clamshell_watcher)
+  while true; do
+    sleep 60
+    sudo -nv 2>/dev/null || true
+  done
+}
+
+watch_auto() {
+  # Long-running watcher. NEVER auto-exits — runs until Ctrl-C/Stop.
+  # Per-session debouncing: Stop puts session into pending_done; if no new
+  # prompt within ALL_DONE_DEBOUNCE_SECS, fire ONE "session done" notification
+  # (if lid closed) and mark done.
+  # When every tracked session is done AND lid is closed, wait a short grace
+  # period, then call `pmset sleepnow` (system sleeps; decaf itself keeps
+  # running, holding pmset=1). On new prompt the flag resets so the next
+  # "all done" cycle can fire sleepnow again.
+  #
+  # State is held in parallel indexed arrays (no associative arrays, works on
+  # macOS system bash 3.2). N is small, linear lookup is fine.
+  local start_ts="$1"
+  local last_ts=$((start_ts - 1))
+  local sleepnow_fired=0
+  local all_done_ts=0   # ts of first moment every session was done; 0 = not currently all-done
+  local all_done_notified=0
+  local -a SIDS=()      # session ids
+  local -a STATES=()    # parallel: "working" | "pending_done" | "done"
+  local -a LASTS=()     # parallel: ts of last state-changing event
+  local -a CWDS=()      # parallel: cwd basename
+  local -a AGENTS=()    # parallel: agent label for notifications
+
+  _sess_idx() {
+    local sid="$1" i
+    for (( i=0; i<${#SIDS[@]}; i++ )); do
+      [[ "${SIDS[$i]}" == "$sid" ]] && { echo "$i"; return 0; }
+    done
+    echo "-1"
+  }
+  _sess_set() {
+    local sid="$1" state="$2" ts="$3" cwd="$4" agent="$5" idx
+    idx=$(_sess_idx "$sid")
+    if [[ "$idx" == "-1" ]]; then
+      SIDS+=("$sid"); STATES+=("$state"); LASTS+=("$ts"); CWDS+=("$cwd"); AGENTS+=("$agent")
+    else
+      STATES[$idx]="$state"; LASTS[$idx]="$ts"; CWDS[$idx]="$cwd"; AGENTS[$idx]="$agent"
+    fi
+  }
+
+  while true; do
+    # 1-second granular sleep so /tmp/decaf.stop responsiveness is ~1s
+    # (TICK_SECS controls event-processing cadence, not stop latency).
+    local _tick
+    for (( _tick=0; _tick<TICK_SECS; _tick++ )); do
+      if [[ -f "$STOP_REQUEST_FILE" ]]; then
+        log "Stop requested via $STOP_REQUEST_FILE — exiting"
+        exit 0
+      fi
+      sleep 1
+    done
+
+    # Pick up live toggle changes from the menubar.
+    load_sleep_settings
+
+    # After a previous all-done sleep cycle we reverted disablesleep to 0 so
+    # the kernel would accept pmset sleepnow. Once we're ticking again the Mac
+    # is awake — re-arm so the "On" state remains true until user toggles Off.
+    # sleepnow_fired stays sticky=1 to prevent immediate re-sleep on the same
+    # done-set; new `prompt` events reset it via the prompt handler.
+    if (( sleepnow_fired == 1 )) && (( CLOSED_LID == 1 )) && (( DISABLESLEEP_SET == 0 )); then
+      log "Awake again — re-arming pmset disablesleep=1 (On mode)"
+      if set_disablesleep 1; then DISABLESLEEP_SET=1; fi
+    fi
+
+    if [[ -f "$EVENT_FILE" ]]; then
+      while IFS=' ' read -r ev_ts ev_type ev_session ev_cwd ev_slug ev_agent; do
+        [[ -z "$ev_ts" ]] && continue
+        last_ts="$ev_ts"
+        ev_session="${ev_session:-?}"
+        ev_cwd="${ev_cwd:-?}"
+        ev_slug="${ev_slug:--}"
+        ev_agent="${ev_agent:-claude}"
+        case "$ev_agent" in
+          codex) ev_agent="Codex" ;;
+          claude) ev_agent="Claude Code" ;;
+        esac
+        case "$ev_type" in
+          prompt)
+            _sess_set "$ev_session" "working" "$ev_ts" "$ev_cwd" "$ev_agent"
+            sleepnow_fired=0   # new work coming — re-arm
+            all_done_ts=0      # cancel any pending sleep-delay timer
+            all_done_notified=0
+            # If we reverted pmset for a previous sleep cycle, re-arm now.
+            if (( CLOSED_LID == 1 )) && (( DISABLESLEEP_SET == 0 )); then
+              log "New prompt — re-arming pmset disablesleep=1"
+              if set_disablesleep 1; then DISABLESLEEP_SET=1; fi
+            fi
+            ;;
+          stop)
+            # Stop fires for any response completion — normal finish OR Esc
+            # interrupt. Either way the session is now idle.
+            _sess_set "$ev_session" "pending_done" "$ev_ts" "$ev_cwd" "$ev_agent"
+            ;;
+          notification)
+            # "idle" subtype = Claude's "I'm waiting for your input" reminder.
+            # Noisy under bypass-permissions, suppress. Permission/attention
+            # requests still surface.
+            if [[ "$ev_slug" == "idle" ]]; then
+              log "Event \"notification\" ($ev_cwd) — idle reminder, skipping"
+            else
+              notify_event "notification" "$start_ts" "$ev_cwd" "$ev_agent"
+            fi
+            ;;
+        esac
+      done < <(awk -v s="$last_ts" '$1 > s' "$EVENT_FILE" 2>/dev/null)
+    fi
+
+    # Promote pending_done → done after debounce, fire ONE notification.
+    local now=$(date +%s) i
+    for (( i=0; i<${#SIDS[@]}; i++ )); do
+      if [[ "${STATES[$i]}" == "pending_done" ]]; then
+        if (( now - LASTS[$i] >= ALL_DONE_DEBOUNCE_SECS )); then
+          notify_event "stop" "$start_ts" "${CWDS[$i]}" "${AGENTS[$i]:-Claude Code}"
+          STATES[$i]="done"
+        fi
+      fi
+    done
+
+    # All tracked sessions done + lid closed → maybe sleep the system.
+    # We DON'T exit decaf — it keeps running and watching for new events.
+    #
+    # Sleep decision tree (controlled by SLEEP_WHEN_DONE / SLEEP_DELAY_MIN from .env):
+    #   SLEEP_WHEN_DONE=1                       → sleep after short all-done grace period
+    #   SLEEP_WHEN_DONE=0 && SLEEP_DELAY_MIN>0  → sleep after N min of continuous all-done state
+    #   SLEEP_WHEN_DONE=0 && SLEEP_DELAY_MIN=0  → never auto-sleep (system stays awake until user acts)
+    if (( ${#SIDS[@]} > 0 )) && (( sleepnow_fired == 0 )); then
+      local all_done=1
+      for (( i=0; i<${#SIDS[@]}; i++ )); do
+        if [[ "${STATES[$i]}" != "done" ]]; then
+          all_done=0; break
+        fi
+      done
+
+      if (( all_done == 0 )); then
+        all_done_ts=0   # at least one session still active — clear pending timer
+        all_done_notified=0
+      else
+        local should_sleep=0
+        local now_ts=$(date +%s)
+        if (( all_done_ts == 0 )); then
+          all_done_ts=$now_ts
+          if (( SLEEP_WHEN_DONE == 0 )) && (( SLEEP_DELAY_MIN > 0 )); then
+            log "All sessions done — sleep deferred ${SLEEP_DELAY_MIN}min (SLEEP_WHEN_DONE=0)"
+          elif (( SLEEP_WHEN_DONE == 0 )); then
+            log "All sessions done — auto-sleep disabled (SLEEP_WHEN_DONE=0, no timer)"
+          fi
+        fi
+        local sleep_grace_remaining=$(( ALL_DONE_SLEEP_GRACE_SECS - (now_ts - all_done_ts) ))
+        if (( sleep_grace_remaining < 0 )); then sleep_grace_remaining=0; fi
+        if (( SLEEP_WHEN_DONE == 1 )) && (( sleep_grace_remaining > 0 )) \
+          && (( all_done_notified == 0 )) && lid_closed; then
+          log "All sessions done + lid closed — notifying; sleep in ${sleep_grace_remaining}s"
+          notify_all_done "$sleep_grace_remaining"
+          all_done_notified=1
+        fi
+        if (( SLEEP_WHEN_DONE == 1 )); then
+          if (( sleep_grace_remaining == 0 )); then
+            should_sleep=1
+          fi
+        elif (( SLEEP_DELAY_MIN > 0 )) && (( now_ts - all_done_ts >= SLEEP_DELAY_MIN * 60 )); then
+          should_sleep=1
+        fi
+
+        if (( should_sleep == 1 )) && lid_closed; then
+          if (( all_done_notified == 0 )); then
+            notify_all_done 0
+            all_done_notified=1
+          fi
+          log "All sessions done + lid closed — reverting pmset, putting system to sleep"
+          # MUST revert disablesleep BEFORE sleep — kernel rejects pmset sleepnow
+          # while SleepDisabled=1 (kIOReturnNotPermitted = 0xe00002e2).
+          if (( DISABLESLEEP_SET == 1 )); then
+            set_disablesleep "$PREV_DISABLESLEEP" 2>/dev/null || true
+            # Verify — the function can return 0 with stale sudo while pmset
+            # silently did nothing. Read kernel state to be sure.
+            local _actual
+            _actual=$(current_sleepdisabled)
+            if [[ "$_actual" == "$PREV_DISABLESLEEP" ]]; then
+              DISABLESLEEP_SET=0
+              log "  pmset reverted to disablesleep=$PREV_DISABLESLEEP"
+            else
+              err "  pmset revert FAILED (state still $_actual) — retrying via osascript admin"
+              osascript -e "do shell script \"/usr/bin/pmset disablesleep $PREV_DISABLESLEEP\" with administrator privileges" >/dev/null 2>&1 || true
+              _actual=$(current_sleepdisabled)
+              if [[ "$_actual" == "$PREV_DISABLESLEEP" ]]; then
+                DISABLESLEEP_SET=0
+                log "  pmset reverted (via osascript fallback)"
+              else
+                err "  pmset still not reverted (state $_actual) — sleep will fail"
+              fi
+            fi
+          fi
+          sleep 1   # let kernel state propagate
+          # Try pmset first; fall back to osascript route through System Events.
+          if ! pmset sleepnow >/dev/null 2>&1; then
+            log "  pmset sleepnow failed, trying osascript sleep"
+            osascript -e 'tell application "System Events" to sleep' >/dev/null 2>&1 \
+              || err "  both sleep paths failed; system stays awake"
+          fi
+          sleepnow_fired=1
+        fi
+      fi
+    fi
+  done
+}
+
+fmt_dur() {
+  local s=$1 m h
+  if (( s < 60 )); then echo "${s}s"; return; fi
+  m=$((s / 60)); s=$((s % 60))
+  if (( m < 60 )); then echo "${m}m${s}s"; return; fi
+  h=$((m / 60)); m=$((m % 60))
+  echo "${h}h${m}m${s}s"
+}
+
+notify_local() {
+  local title="$1" msg="$2" sound="${3:-}"
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    local args=(-title "$title" -message "$msg" -sender com.decaf)
+    [[ -n "$sound" ]] && args+=(-sound "$sound")
+    terminal-notifier "${args[@]}" >/dev/null 2>&1 || true
+  else
+    local t m s=""
+    t=${title//\"/\\\"}
+    m=${msg//\"/\\\"}
+    if [[ -n "$sound" ]]; then
+      local sn=${sound//\"/\\\"}
+      s=" sound name \"$sn\""
+    fi
+    osascript -e "display notification \"$m\" with title \"$t\"${s}" >/dev/null 2>&1 || true
+  fi
+}
+
+play_system_sound() {
+  local sound="$1" file="/System/Library/Sounds/${sound}.aiff"
+  [[ -r "$file" ]] || return 0
+  /usr/bin/afplay "$file" >/dev/null 2>&1 || true
+}
+
+notify_all_done() {
+  local seconds="${1:-0}" title body
+  title="decaf: all agents done"
+  if [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds > 0 )); then
+    body="All tracked Claude Code / Codex sessions finished.
+Sleeping Mac in ${seconds}s."
+  else
+    body="All tracked Claude Code / Codex sessions finished.
+Sleeping Mac now."
+  fi
+  notify_local "$title" "$body"
+  notify_webhook "$title" "$body"
+  notify_telegram "$title" "$body"
+  play_system_sound "Glass"
+}
+
+notify_event() {
+  # Per-session "session went idle" or "session needs attention" notification.
+  # Suppressed entirely if lid is open — user is at the keyboard.
+  local ev_type="$1" start_ts="$2" cwd="$3" agent="${4:-Claude Code}"
+  local title body sound dur_str
+  dur_str=$(fmt_dur "$(( $(date +%s) - start_ts ))")
+  case "$ev_type" in
+    stop)
+      title="decaf: session done (${cwd})"
+      body="${agent} in ${cwd} finished
+running ${dur_str}"
+      sound="Glass"
+      ;;
+    notification)
+      title="decaf: session needs you (${cwd})"
+      body="${agent} in ${cwd} is waiting
+running ${dur_str}"
+      sound="Hero"
+      ;;
+    *)
+      title="decaf: event ${ev_type} (${cwd})"
+      body="running ${dur_str}"
+      sound="Pop"
+      ;;
+  esac
+  if ! lid_closed; then
+    log "Event \"$ev_type\" ($cwd) — lid open, notification suppressed"
+    return 0
+  fi
+  log "Event \"$ev_type\" ($cwd) — notifying (lid closed)"
+  notify_local "$title" "$body" "$sound"
+  # Notification Center sound depends on per-app permissions that osascript
+  # often doesn't have; play the sound directly so it's always audible.
+  play_system_sound "$sound"
+  notify_webhook "$title" "$body"
+  notify_telegram "$title" "$body"
+}
+
+notify_webhook() {
+  local title="$1" body="$2"
+  [[ -z "$WEBHOOK" ]] && return 0
+  curl -fsS -X POST -H "Title: $title" --data "$body" "$WEBHOOK" >/dev/null 2>&1 || true
+}
+
+# Reads TELEGRAM_TOKEN + TELEGRAM_CHAT_ID from (in order): $DECAF_ENV_FILE,
+# $PWD/.env, ~/.decaf/.env. Re-reads on every call so UI edits via the
+# menubar propagate live without restarting decaf.
+load_telegram_creds() {
+  local envfile=""
+  for candidate in \
+    "${DECAF_ENV_FILE:-}" \
+    "${PWD}/.env" \
+    "${HOME}/.decaf/.env"
+  do
+    if [[ -n "$candidate" && -r "$candidate" ]]; then
+      envfile="$candidate"; break
+    fi
+  done
+  [[ -z "$envfile" ]] && return 0
+
+  # bash 3.2 + `set -o pipefail` quirk: grep returning 1 (no match) makes
+  # the command substitution exit nonzero, which `set -e` then trips on
+  # despite the empty value being expected. The `|| true` shields us.
+  local val
+  val=$(grep -E '^[[:space:]]*TELEGRAM_TOKEN=' "$envfile" 2>/dev/null \
+        | head -1 | cut -d= -f2- \
+        | sed -E 's/^[[:space:]]*["'\'']?(.*)["'\'']?[[:space:]]*$/\1/' \
+        || true)
+  TELEGRAM_TOKEN="$val"
+
+  val=$(grep -E '^[[:space:]]*TELEGRAM_CHAT_ID=' "$envfile" 2>/dev/null \
+        | head -1 | cut -d= -f2- \
+        | sed -E 's/^[[:space:]]*["'\'']?(.*)["'\'']?[[:space:]]*$/\1/' \
+        || true)
+  TELEGRAM_CHAT_ID="$val"
+  true   # ensure function returns 0 even if last [[ test was false
+}
+
+notify_telegram() {
+  local title="$1" body="$2"
+  # Re-read .env on every send so UI edits propagate without restart.
+  load_telegram_creds
+  [[ -z "${TELEGRAM_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
+  curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${title}
+${body}" \
+    >/dev/null 2>&1 || true
+}
+
+# Resolves the .env file we should be reading. Same search order as
+# load_telegram_creds. Returns empty string if no env file exists.
+resolve_env_file() {
+  local candidate
+  for candidate in \
+    "${DECAF_ENV_FILE:-}" \
+    "${PWD}/.env" \
+    "${HOME}/.decaf/.env"
+  do
+    if [[ -n "$candidate" && -r "$candidate" ]]; then
+      echo "$candidate"; return 0
+    fi
+  done
+  echo ""
+}
+
+# Loads SLEEP_WHEN_DONE / SLEEP_DELAY_MIN from .env. Called once at startup and
+# again every tick in watch_auto so the menubar toggle takes effect live.
+load_sleep_settings() {
+  local envfile val
+  envfile=$(resolve_env_file)
+  [[ -z "$envfile" ]] && return 0
+  val=$(grep -E '^[[:space:]]*SLEEP_WHEN_DONE=' "$envfile" 2>/dev/null \
+        | head -1 | cut -d= -f2- \
+        | sed -E 's/^[[:space:]]*["'\'']?(.*)["'\'']?[[:space:]]*$/\1/' \
+        || true)
+  if [[ "$val" =~ ^[01]$ ]]; then SLEEP_WHEN_DONE="$val"; fi
+  val=$(grep -E '^[[:space:]]*SLEEP_DELAY_MIN=' "$envfile" 2>/dev/null \
+        | head -1 | cut -d= -f2- \
+        | sed -E 's/^[[:space:]]*["'\'']?(.*)["'\'']?[[:space:]]*$/\1/' \
+        || true)
+  if [[ "$val" =~ ^[0-9]+$ ]]; then SLEEP_DELAY_MIN="$val"; fi
+  true
+}
+
+cleanup() {
+  set +e
+  # Kill subprocesses with SIGTERM, then SIGKILL anything still alive 1s later.
+  # Skip `wait` — it blocked forever in the wild when a child got hung in its
+  # own (inherited) cleanup. Now that we clear traps in subshells, normal SIGTERM
+  # is enough, but the SIGKILL backstop protects against future regressions.
+  local _p
+  for _p in "$CAFFEINATE_PID" "$WATCHER_PID" "$KEEPALIVE_PID"; do
+    [[ -n "$_p" ]] && kill "$_p" 2>/dev/null
+  done
+  sleep 1
+  for _p in "$CAFFEINATE_PID" "$WATCHER_PID" "$KEEPALIVE_PID"; do
+    [[ -n "$_p" ]] && kill -0 "$_p" 2>/dev/null && kill -9 "$_p" 2>/dev/null
+  done
+  if (( DISABLESLEEP_SET == 1 )); then
+    if ! set_disablesleep "$PREV_DISABLESLEEP"; then
+      err "FAILED to revert pmset disablesleep — run: sudo pmset -b disablesleep $PREV_DISABLESLEEP"
+    fi
+    # If lid is still closed at this point, the kernel won't re-trigger sleep
+    # on its own (clamshell event was "absorbed" while disablesleep=1). Nudge it.
+    if lid_closed; then
+      log "lid still closed → forcing sleep (pmset sleepnow)"
+      pmset sleepnow 2>/dev/null || true
+    fi
+  fi
+  if [[ -f "$STATE_FILE" ]]; then
+    local file_pid
+    file_pid=$(awk '{print $1}' "$STATE_FILE" 2>/dev/null || true)
+    [[ "$file_pid" == "$$" ]] && rm -f "$STATE_FILE"
+  fi
+  [[ -n "$OUT_FILE" && -f "$OUT_FILE" ]] && rm -f "$OUT_FILE"
+}
+
+# ---------- decaf setup ----------
+
+# Python helper used by setup/remove/check for Claude Code and Codex hook JSON.
+# Single source of truth for both JSON shapes. Uses preinstalled python3 — no
+# external dependency required.
+SETUP_PY='
+import json, sys, os, shlex
+
+op = sys.argv[1]
+profile = sys.argv[2]
+path = sys.argv[3]
+hook_bin = sys.argv[4] if len(sys.argv) > 4 else ""
+MARKER = "decaf-hook"
+
+def is_ours(cmd):
+    return MARKER in (cmd or "")
+
+def event_specs():
+    if profile == "claude":
+        return (
+            ("Stop", "stop", None, None),
+            ("Notification", "notification", None, None),
+            ("UserPromptSubmit", "prompt", None, None),
+        )
+    if profile == "codex":
+        return (
+            ("UserPromptSubmit", "prompt", None, "Decaf: tracking Codex prompt"),
+            ("Stop", "stop", None, "Decaf: tracking Codex stop"),
+            ("PermissionRequest", "notification", "*", "Decaf: tracking Codex permission request"),
+        )
+    sys.stderr.write("unknown profile: {}\n".format(profile))
+    sys.exit(2)
+
+def has_hook(data):
+    for ev, _, _, _ in event_specs():
+        for entry in (data.get("hooks", {}) or {}).get(ev, []) or []:
+            for h in entry.get("hooks", []) or []:
+                if is_ours(h.get("command")):
+                    return True
+    return False
+
+try:
+    data = json.load(open(path)) if os.path.exists(path) else {}
+except (json.JSONDecodeError, OSError) as e:
+    sys.stderr.write("failed to read {}: {}\n".format(path, e))
+    sys.exit(2)
+
+if op == "check":
+    sys.exit(0 if has_hook(data) else 1)
+
+EVENTS = event_specs()
+
+def remove_ours(hooks):
+    removed = []
+    for ev_name, _, _, _ in EVENTS:
+        entries = hooks.get(ev_name) or []
+        new_entries = []
+        for entry in entries:
+            entry_hooks = entry.get("hooks") or []
+            kept_hooks = [h for h in entry_hooks if not is_ours(h.get("command"))]
+            if len(kept_hooks) != len(entry_hooks):
+                removed.append(ev_name)
+            if kept_hooks:
+                new_entry = dict(entry)
+                new_entry["hooks"] = kept_hooks
+                new_entries.append(new_entry)
+        if new_entries:
+            hooks[ev_name] = new_entries
+        elif ev_name in hooks:
+            del hooks[ev_name]
+    return sorted(set(removed))
+
+def make_hook(ev_arg, status):
+    agent_arg = "codex" if profile == "codex" else "claude"
+    hook = {
+        "type": "command",
+        "command": "{} {} {}".format(shlex.quote(hook_bin), ev_arg, agent_arg),
+    }
+    if profile == "codex":
+        hook["timeout"] = 5
+        if status:
+            hook["statusMessage"] = status
+    return hook
+
+def append_hooks(hooks):
+    added = []
+    for ev_name, ev_arg, matcher, status in EVENTS:
+        ev_entries = hooks.setdefault(ev_name, [])
+        entry = {"hooks": [make_hook(ev_arg, status)]}
+        if matcher is not None:
+            entry["matcher"] = matcher
+        ev_entries.append(entry)
+        added.append(ev_name)
+    return added
+
+if op == "add":
+    hooks = data.setdefault("hooks", {})
+    remove_ours(hooks)
+    added = append_hooks(hooks)
+    if added:
+        sys.stderr.write("configured: " + ",".join(added) + "\n")
+elif op == "remove":
+    hooks = data.get("hooks") or {}
+    removed = remove_ours(hooks)
+    if not hooks:
+        data.pop("hooks", None)
+    if removed:
+        sys.stderr.write("removed: " + ",".join(removed) + "\n")
+else:
+    sys.stderr.write("unknown op: {}\n".format(op))
+    sys.exit(2)
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".new"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+'
+
+resolve_hook_bin() {
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  if command -v decaf-hook >/dev/null 2>&1; then
+    command -v decaf-hook
+  elif [[ -x "${script_dir}/decaf-hook.sh" ]]; then
+    echo "${script_dir}/decaf-hook.sh"
+  elif [[ -x "/usr/local/bin/decaf-hook" ]]; then
+    echo "/usr/local/bin/decaf-hook"
+  else
+    echo "/usr/local/bin/decaf-hook"   # default install path; may not exist yet
+  fi
+}
+
+require_python3() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    err "python3 not found. Install Xcode CLT (\`xcode-select --install\`) or \`brew install python\`"
+    return 1
+  fi
+}
+
+claude_hooks_present() {
+  [[ -f "$CLAUDE_SETTINGS" ]] || return 1
+  python3 -c "$SETUP_PY" check claude "$CLAUDE_SETTINGS"
+}
+
+codex_hooks_present() {
+  [[ -f "$CODEX_HOOKS" ]] || return 1
+  python3 -c "$SETUP_PY" check codex "$CODEX_HOOKS"
+}
+
+setup_claude_code() {
+  local hook_bin="$1"
+  if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    if ! command -v claude >/dev/null 2>&1; then
+      log "Claude Code: not detected (no $CLAUDE_SETTINGS, no \`claude\` in PATH) — skipping"
+      return 0
+    fi
+    log "Claude Code: creating $CLAUDE_SETTINGS"
+    mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+    echo '{}' > "$CLAUDE_SETTINGS"
+  fi
+  cp "$CLAUDE_SETTINGS" "${CLAUDE_SETTINGS}.decaf.bak"
+  local added
+  added=$(python3 -c "$SETUP_PY" add claude "$CLAUDE_SETTINGS" "$hook_bin" 2>&1 1>/dev/null)
+  if [[ -n "$added" ]]; then
+    log "Claude Code: $added → $hook_bin"
+    log "  backup:  ${CLAUDE_SETTINGS}.decaf.bak"
+  else
+    log "Claude Code: all hooks already configured (no change)"
+  fi
+}
+
+remove_claude_code() {
+  if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    log "Claude Code: no $CLAUDE_SETTINGS — nothing to remove"
+    return 0
+  fi
+  if ! claude_hooks_present; then
+    log "Claude Code: no decaf hooks present — nothing to remove"
+    return 0
+  fi
+  cp "$CLAUDE_SETTINGS" "${CLAUDE_SETTINGS}.decaf.bak"
+  local removed
+  removed=$(python3 -c "$SETUP_PY" remove claude "$CLAUDE_SETTINGS" 2>&1 1>/dev/null)
+  log "Claude Code: ${removed:-removed decaf hooks} from $CLAUDE_SETTINGS"
+  log "  backup:  ${CLAUDE_SETTINGS}.decaf.bak"
+}
+
+setup_codex_cli() {
+  local hook_bin="$1"
+  if [[ ! -f "$CODEX_HOOKS" && ! -f "$CODEX_CONFIG" ]] && ! command -v codex >/dev/null 2>&1; then
+    log "Codex CLI: not detected (no $CODEX_HOOKS, no $CODEX_CONFIG, no \`codex\` in PATH) — skipping"
+    return 0
+  fi
+  if [[ -f "$CODEX_HOOKS" ]]; then
+    cp "$CODEX_HOOKS" "${CODEX_HOOKS}.decaf.bak"
+  fi
+  local added
+  added=$(python3 -c "$SETUP_PY" add codex "$CODEX_HOOKS" "$hook_bin" 2>&1 1>/dev/null)
+  log "Codex CLI: ${added:-configured decaf hooks} → $hook_bin"
+  if [[ -f "${CODEX_HOOKS}.decaf.bak" ]]; then
+    log "  backup:  ${CODEX_HOOKS}.decaf.bak"
+  fi
+  log "  note: if Codex asks to review new hooks, open \`/hooks\` and trust Decaf."
+  log "  note: restart any Codex sessions that were already open before setup."
+}
+
+remove_codex_cli() {
+  if [[ ! -f "$CODEX_HOOKS" ]]; then
+    log "Codex CLI: no $CODEX_HOOKS — nothing to remove"
+    return 0
+  fi
+  if ! codex_hooks_present; then
+    log "Codex CLI: no decaf hooks present — nothing to remove"
+    return 0
+  fi
+  cp "$CODEX_HOOKS" "${CODEX_HOOKS}.decaf.bak"
+  local removed
+  removed=$(python3 -c "$SETUP_PY" remove codex "$CODEX_HOOKS" 2>&1 1>/dev/null)
+  log "Codex CLI: ${removed:-removed decaf hooks} from $CODEX_HOOKS"
+  log "  backup:  ${CODEX_HOOKS}.decaf.bak"
+}
+
+cmd_setup() {
+  require_python3 || exit 6
+  local hook_bin
+  hook_bin=$(resolve_hook_bin)
+  log "Using hook binary: $hook_bin"
+  if (( SETUP_REMOVE == 1 )); then
+    remove_claude_code
+    remove_codex_cli
+  else
+    setup_claude_code "$hook_bin"
+    setup_codex_cli "$hook_bin"
+  fi
+}
+
+# ---------- main ----------
+
+main() {
+  parse_flags "$@"
+  load_telegram_creds
+  load_sleep_settings
+
+  if [[ "$SUBCMD" == "setup" ]]; then
+    cmd_setup
+    exit 0
+  fi
+
+  mkdir -p "$LOG_DIR"
+  OUT_FILE=$(mktemp -t decaf.out.XXXXXX)
+
+  # Clear stale stop-request file from a previous session — otherwise we'd
+  # exit on the first tick. Multiple instances all clear it at startup, which
+  # is fine; the file is just a flag.
+  rm -f "$STOP_REQUEST_FILE" 2>/dev/null || true
+
+  trap 'cleanup' EXIT
+  trap 'exit 130' INT TERM HUP
+
+  if (( CLOSED_LID == 1 )); then
+    battery_check
+    PREV_DISABLESLEEP=$(current_sleepdisabled)
+    [[ -z "$PREV_DISABLESLEEP" ]] && PREV_DISABLESLEEP="0"
+    # Defensive: if disablesleep was ALREADY 1 at startup, it's almost
+    # certainly stale state from a previous decaf run that didn't clean
+    # up. Treat PREV as 0 so cleanup/sleep paths can revert properly.
+    if [[ "$PREV_DISABLESLEEP" == "1" ]]; then
+      log "Note: pmset disablesleep was already 1 at startup (likely stale from"
+      log "      a previous run that didn't clean up). Forcing PREV=0 so we"
+      log "      revert cleanly on exit/sleep."
+      PREV_DISABLESLEEP="0"
+    fi
+    # Three startup paths for getting privileged pmset access:
+    #   1. Already root (legacy: launched via osascript admin) — no prompt needed.
+    #   2. NOPASSWD rule installed (current default: menubar app drops a narrow
+    #      rule into /etc/sudoers.d/decaf on first Start) — `sudo -n` works
+    #      silently across reboots, no keepalive required.
+    #   3. Neither — fall back to interactive `sudo -v` + keepalive, same as
+    #      pre-rule behavior. Lets `decaf --closed-lid` keep working from a
+    #      plain terminal even if the rule was never installed.
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+      log "Running as root (likely via osascript admin) — skipping sudo prompt"
+    elif sudo -n /usr/bin/pmset -b disablesleep "$PREV_DISABLESLEEP" 2>/dev/null; then
+      HAS_NOPASSWD_PMSET=1
+      log "Sudoers rule detected — pmset toggles don't need a password"
+    else
+      log "Authenticating sudo (one-time, needed so we can revert pmset later without prompting)…"
+      if ! sudo -v; then
+        err "sudo authentication failed — can't safely manage pmset"; exit 4
+      fi
+    fi
+    log "Setting pmset disablesleep=1"
+    set_disablesleep 1
+    if [[ "$(current_sleepdisabled)" != "1" ]]; then
+      err "Failed to set pmset disablesleep=1"; exit 4
+    fi
+    DISABLESLEEP_SET=1
+    echo "$$ active $(date +%s)" > "$STATE_FILE"
+    clamshell_watcher "$$" &
+    WATCHER_PID=$!
+    # sudo_keepalive only needed for the legacy interactive-sudo path. Skip it
+    # when we're root (no sudo at all) or when the NOPASSWD rule is in place
+    # (NOPASSWD doesn't expire so the timestamp doesn't need refreshing).
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]] && (( HAS_NOPASSWD_PMSET != 1 )); then
+      sudo_keepalive &
+      KEEPALIVE_PID=$!
+      log "Closed-lid mode armed (watcher pid $WATCHER_PID, sudo keepalive $KEEPALIVE_PID)"
+    else
+      log "Closed-lid mode armed (watcher pid $WATCHER_PID, no sudo keepalive)"
+    fi
+    # Nudge the menubar app awake so the user sees Decaf is active. No-op if
+    # already running; silently ignored if the app isn't installed.
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+      open -gj -b com.decaf.menubar 2>/dev/null || true
+    fi
+  fi
+
+  hold_idle_assertion
+
+  local start_ts child_ec=0
+  start_ts=$(date +%s)
+
+  if (( AUTO_MODE == 1 )); then
+    # Events file is an IPC channel, not a log — decaf-hook (separate
+    # process spawned by Claude Code / Codex) appends events here, watcher reads them.
+    # Watcher only cares about events with ts >= start_ts, so older lines are
+    # dead weight. Truncate at start so the file stays bounded to one session.
+    [[ -e "$EVENT_FILE" ]] && : > "$EVENT_FILE"
+    log "Listening for Claude Code / Codex hook events (Stop / UserPromptSubmit / Notification / PermissionRequest)."
+    if ! claude_hooks_present 2>/dev/null && ! codex_hooks_present 2>/dev/null; then
+      log "Tip: run \`decaf setup\` to wire up Claude Code / Codex hooks (no events otherwise)."
+    fi
+    if (( CLOSED_LID == 1 )); then
+      log "Closed-lid armed — system stays awake with lid shut."
+    fi
+    log "One notification per agent when truly idle (${ALL_DONE_DEBOUNCE_SECS}s after its last Stop)."
+    if (( SLEEP_WHEN_DONE == 1 )); then
+      log "When all done + lid closed: \`pmset sleepnow\` after ${ALL_DONE_SLEEP_GRACE_SECS}s (decaf itself keeps running)."
+    elif (( SLEEP_DELAY_MIN > 0 )); then
+      log "When all done + lid closed: sleep deferred ${SLEEP_DELAY_MIN}min (SLEEP_WHEN_DONE=0)."
+    else
+      log "Auto-sleep disabled (SLEEP_WHEN_DONE=0, no timer) — system stays awake until you act."
+    fi
+    log "Runs until Ctrl-C — never auto-exits."
+    watch_auto "$start_ts"
+    # watch_auto never returns; control resumes only via signal → cleanup.
+    return 0
+  elif [[ -n "$WATCH_PID" ]]; then
+    log "Watching PID $WATCH_PID"
+    while kill -0 "$WATCH_PID" 2>/dev/null; do sleep 2; done
+  else
+    log "Running: ${CMD[*]}"
+    set +e
+    "${CMD[@]}" 2>&1 | tee "$OUT_FILE"
+    child_ec=${PIPESTATUS[0]}
+    set -e
+  fi
+
+  local end_ts dur dur_str tail_out title body
+  end_ts=$(date +%s)
+  dur=$((end_ts - start_ts))
+  dur_str=$(fmt_dur "$dur")
+  tail_out=""
+  [[ -s "$OUT_FILE" ]] && tail_out=$(tail -10 "$OUT_FILE")
+
+  if [[ -n "$WATCH_PID" ]]; then
+    title="decaf: PID $WATCH_PID done (${dur_str})"
+    body="watched pid: $WATCH_PID
+duration: ${dur_str}"
+  else
+    if (( child_ec == 0 )); then
+      title="decaf: done in ${dur_str}"
+    else
+      title="decaf: exit $child_ec in ${dur_str}"
+    fi
+    body="cmd: ${CMD[*]}
+duration: ${dur_str}
+exit: $child_ec"
+    [[ -n "$tail_out" ]] && body="$body
+---
+$tail_out"
+  fi
+
+  if lid_closed; then
+    log "Lid closed — notifying"
+    notify_local "$title" "$body"
+    notify_webhook "$title" "$body"
+    notify_telegram "$title" "$body"
+  else
+    log "Lid open — notifications suppressed (you can see the result in the terminal)"
+  fi
+
+  exit "$child_ec"
+}
+
+main "$@"
